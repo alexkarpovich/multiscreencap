@@ -1,18 +1,24 @@
 use anyhow::{anyhow, Context, Result};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 use std::thread;
-use std::io::{Write, BufRead, BufReader};
-
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 use crate::window::WindowInfo;
 
 #[cfg(target_os = "macos")]
 use crate::macos;
+
+#[derive(Clone, Copy, Debug)]
+pub enum VideoEncoder {
+    H264VideoToolbox,
+    Libx264,
+    // You can add ProRes/HEVC variants if you want different tradeoffs.
+}
 
 /// Builder for ffmpeg commands to separate concerns
 pub struct FfmpegCommandBuilder {
@@ -22,13 +28,19 @@ pub struct FfmpegCommandBuilder {
     fps: i32,
     bitrate_kbps: i32,
     output_path: PathBuf,
-    window_x: i32,
-    window_y: i32,
-    window_id: u64,
+    encoder: VideoEncoder,
 }
 
 impl FfmpegCommandBuilder {
-    pub fn new(ffmpeg_path: PathBuf, width: usize, height: usize, fps: i32, bitrate_kbps: i32, output_path: PathBuf, window_x: i32, window_y: i32, window_id: u64) -> Self {
+    pub fn new(
+        ffmpeg_path: PathBuf,
+        width: usize,
+        height: usize,
+        fps: i32,
+        bitrate_kbps: i32,
+        output_path: PathBuf,
+        encoder: VideoEncoder,
+    ) -> Self {
         Self {
             ffmpeg_path,
             width,
@@ -36,36 +48,73 @@ impl FfmpegCommandBuilder {
             fps,
             bitrate_kbps,
             output_path,
-            window_x,
-            window_y,
-            window_id,
+            encoder,
         }
     }
 
     pub fn build(&self) -> Command {
         let mut cmd = Command::new(&self.ffmpeg_path);
         cmd.arg("-hide_banner")
-            .arg("-loglevel").arg("warning")
+            .arg("-loglevel")
+            .arg("warning")
             .arg("-y");
 
         // rawvideo from stdin has no timestamps; -r defines input fps
-        cmd.arg("-f").arg("rawvideo")
-            .arg("-pix_fmt").arg("rgba")
-            .arg("-s").arg(format!("{}x{}", self.width, self.height))
-            .arg("-r").arg(format!("{}", self.fps))
-            .arg("-i").arg("-");
+        cmd.arg("-f")
+            .arg("rawvideo")
+            .arg("-pix_fmt")
+            .arg("rgba")
+            .arg("-s")
+            .arg(format!("{}x{}", self.width, self.height))
+            .arg("-r")
+            .arg(format!("{}", self.fps))
+            .arg("-i")
+            .arg("-");
 
         // Force CFR on output to match wall-clock emission
-        cmd.arg("-vsync").arg("cfr")
-            .arg("-r").arg(format!("{}", self.fps))
-            .arg("-pix_fmt").arg("yuv420p")
-            .arg("-c:v").arg("h264_videotoolbox")
-            .arg("-b:v").arg(format!("{}k", self.bitrate_kbps))
-            .arg("-maxrate").arg(format!("{}k", self.bitrate_kbps + 1000))
-            .arg("-bufsize").arg(format!("{}k", self.bitrate_kbps * 2))
-            .arg("-g").arg(format!("{}", self.fps * 2));
+        cmd.arg("-vsync")
+            .arg("cfr")
+            .arg("-r")
+            .arg(format!("{}", self.fps))
+            .arg("-pix_fmt")
+            .arg("yuv420p");
 
-        cmd.arg("-movflags").arg("faststart")
+        match self.encoder {
+            VideoEncoder::H264VideoToolbox => {
+                cmd.arg("-c:v")
+                    .arg("h264_videotoolbox")
+                    .arg("-b:v")
+                    .arg(format!("{}k", self.bitrate_kbps))
+                    .arg("-maxrate")
+                    .arg(format!("{}k", self.bitrate_kbps + 1000))
+                    .arg("-bufsize")
+                    .arg(format!("{}k", self.bitrate_kbps * 2))
+                    .arg("-g")
+                    .arg(format!("{}", self.fps * 2));
+            }
+            VideoEncoder::Libx264 => {
+                cmd.arg("-c:v")
+                    .arg("libx264")
+                    .arg("-preset")
+                    .arg("veryfast")
+                    .arg("-tune")
+                    .arg("zerolatency")
+                    .arg("-b:v")
+                    .arg(format!("{}k", self.bitrate_kbps))
+                    .arg("-g")
+                    .arg(format!("{}", self.fps * 2))
+                    .arg("-x264-params")
+                    .arg(format!(
+                        "keyint={}:min-keyint={}:scenecut=0",
+                        self.fps * 2,
+                        self.fps
+                    ));
+            }
+        }
+
+        // MP4 with faststart for better compatibility
+        cmd.arg("-movflags")
+            .arg("faststart")
             .arg(&self.output_path)
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -73,14 +122,46 @@ impl FfmpegCommandBuilder {
     }
 }
 
+/// Spawn ffmpeg with the chosen encoder; stdin is piped for raw frames.
+fn spawn_ffmpeg_checked(
+    ffmpeg: &PathBuf,
+    width: usize,
+    height: usize,
+    fps: i32,
+    bitrate_kbps: i32,
+    out_path: &PathBuf,
+    encoder: VideoEncoder,
+) -> Result<Child> {
+    let builder = FfmpegCommandBuilder::new(
+        ffmpeg.clone(),
+        width,
+        height,
+        fps,
+        bitrate_kbps,
+        out_path.clone(),
+        encoder,
+    );
+    let mut cmd = builder.build();
+    info!("Executing ffmpeg command: {:?}", cmd);
+
+    let child = cmd
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| "failed to spawn ffmpeg")?;
+
+    Ok(child)
+}
+
 /// Send quit signal to ffmpeg and wait for it to exit
 pub fn send_quit_and_wait(child: &mut Child) -> Result<()> {
     info!("Stopping ffmpeg process...");
 
+    // Close stdin first to signal end of input
     if let Some(stdin) = child.stdin.take() {
         drop(stdin);
     }
 
+    // Wait for ffmpeg to finish processing and exit gracefully
     let start = Instant::now();
     loop {
         match child.try_wait() {
@@ -109,7 +190,8 @@ pub fn send_quit_and_wait(child: &mut Child) -> Result<()> {
         }
     }
 
-    std::thread::sleep(Duration::from_millis(1000));
+    // Give filesystem extra time to flush
+    std::thread::sleep(Duration::from_millis(500));
     info!("ffmpeg process stopped");
     Ok(())
 }
@@ -125,10 +207,15 @@ pub fn build_output_path(
         .unwrap_or(Duration::from_secs(0))
         .as_secs();
 
+    // Use custom filename or generate default
     let filename = if let Some(custom_name) = custom_filename {
+        // Sanitize custom filename and ensure .mp4 extension
         let sanitized = sanitize_filename::sanitize_with_options(
             custom_name,
-            sanitize_filename::Options { truncate: true, ..Default::default() },
+            sanitize_filename::Options {
+                truncate: true,
+                ..Default::default()
+            },
         );
         if sanitized.ends_with(".mp4") {
             sanitized
@@ -136,11 +223,18 @@ pub fn build_output_path(
             format!("{}_{}.mp4", sanitized, ts)
         }
     } else {
+        // Default auto-generated filename
         let sanitized_title = sanitize_filename::sanitize_with_options(
             format!("{}_{}", info.owner_name, info.window_title),
-            sanitize_filename::Options { truncate: true, ..Default::default() },
+            sanitize_filename::Options {
+                truncate: true,
+                ..Default::default()
+            },
         );
-        format!("recording_{}_{}_{}.mp4", info.window_id, sanitized_title, ts)
+        format!(
+            "recording_{}_{}_{}.mp4",
+            info.window_id, sanitized_title, ts
+        )
     };
 
     let base_dir = output_dir
@@ -156,7 +250,6 @@ pub fn build_output_path(
 
 /// Nearest-neighbor resize of RGBA buffer to a fixed size
 fn resize_rgba_nn(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
-    // Avoid divide-by-zero
     if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
         return vec![0u8; dw.saturating_mul(dh).saturating_mul(4)];
     }
@@ -190,55 +283,87 @@ pub fn start_ffmpeg_for_window(
     custom_filename: Option<&str>,
 ) -> Result<(Child, Arc<AtomicBool>, PathBuf)> {
     let out_path = build_output_path(info, output_dir, custom_filename)?;
-    info!("Recording window {} ({}x{}) -> {}", info.window_id, info.width, info.height, out_path.display());
+    info!(
+        "Recording window {} ({}x{}) -> {}",
+        info.window_id,
+        info.width,
+        info.height,
+        out_path.display()
+    );
 
     #[cfg(target_os = "macos")]
     {
-        // Capture once to get actual dimensions and seed the first frame
-        let (actual_width, actual_height, mut last_frame) = if let Some((buffer, w, h)) = macos::capture_window_image(info.window_id) {
-            info!("Detected actual window dimensions: {}x{}", w, h);
-            (w, h, Some(buffer))
-        } else {
-            warn!("Failed to capture window to get dimensions, using stored dimensions (may be inaccurate)");
-            let w = if info.width % 2 != 0 { info.width + 1 } else { info.width }.max(2) as usize;
-            let h = if info.height % 2 != 0 { info.height + 1 } else { info.height }.max(2) as usize;
-            (w, h, None)
-        };
+        // First capture to discover actual size and seed a frame
+        let (mut actual_w, mut actual_h, mut last_frame) =
+            if let Some((buffer, w, h)) = macos::capture_window_image(info.window_id) {
+                info!("Detected actual window dimensions: {}x{}", w, h);
+                (w, h, Some(buffer))
+            } else {
+                warn!("Failed to capture window for dimensions; using stored values");
+                (
+                    info.width.max(2) as usize,
+                    info.height.max(2) as usize,
+                    None,
+                )
+            };
 
-        // Expected dimensions for ffmpeg rawvideo stream
-        let expected_width = actual_width;
-        let expected_height = actual_height;
-        info!("Recording window {} at fixed stream size {}x{}", info.window_id, expected_width, expected_height);
+        // Enforce even dimensions for YUV420 encoders
+        if actual_w % 2 != 0 {
+            actual_w += 1;
+        }
+        if actual_h % 2 != 0 {
+            actual_h += 1;
+        }
 
-        // Ensure the seeded frame matches expected size
+        let expected_w = actual_w;
+        let expected_h = actual_h;
+        info!("Fixed stream size: {}x{}", expected_w, expected_h);
+
+        // Normalize the seeded frame if it doesn't match expected size
         if let Some(ref buf) = last_frame {
-            // If first capture isn't the expected size, normalize it
-            let len = buf.len();
-            let maybe_src_w = len / 4 / expected_height; // heuristic only if mismatched; we normalize anyway
-            if maybe_src_w != expected_width {
-                last_frame = Some(resize_rgba_nn(buf, maybe_src_w, expected_height, expected_width, expected_height));
+            // We know the real w,h from the capture above; if mismatch, normalize
+            if let Some((_, w, h)) = macos::capture_window_image(info.window_id) {
+                if w != expected_w || h != expected_h {
+                    last_frame = Some(resize_rgba_nn(buf, w, h, expected_w, expected_h));
+                }
             }
         }
 
-        // Build and spawn ffmpeg command with fixed dimensions
-        let cmd_builder = FfmpegCommandBuilder::new(
-            ffmpeg.clone(),
-            expected_width,
-            expected_height,
+        // Try hardware encoder first
+        let mut encoder = VideoEncoder::H264VideoToolbox;
+        let mut child = spawn_ffmpeg_checked(
+            ffmpeg,
+            expected_w,
+            expected_h,
             fps,
             bitrate_kbps,
-            out_path.clone(),
-            info.x,
-            info.y,
-            info.window_id,
-        );
-        let mut cmd = cmd_builder.build();
+            &out_path,
+            encoder,
+        )
+        .context("failed to spawn ffmpeg (hardware)")?;
 
-        info!("Executing ffmpeg command: {:?}", cmd);
-
-        let mut child = cmd.stdin(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to spawn ffmpeg for window {}", info.window_id))?;
+        // If ffmpeg exits early, fall back to libx264
+        thread::sleep(Duration::from_millis(250));
+        if let Ok(Some(status)) = child.try_wait() {
+            error!("Hardware encoder process exited immediately: {:?}", status);
+            encoder = VideoEncoder::Libx264;
+            child = spawn_ffmpeg_checked(
+                ffmpeg,
+                expected_w,
+                expected_h,
+                fps,
+                bitrate_kbps,
+                &out_path,
+                encoder,
+            )
+            .context("failed to spawn ffmpeg (libx264 fallback)")?;
+            info!(
+                "Using software encoder (libx264) for window {}",
+                info.window_id
+            );
+        } else {
+            info!("Hardware encoder started OK for window {}", info.window_id);
+        }
 
         // Log ffmpeg stderr in background (single reader)
         if let Some(stderr) = child.stderr.take() {
@@ -257,6 +382,7 @@ pub fn start_ffmpeg_for_window(
             });
         }
 
+        // Create stop signal for the capture/emitter thread
         let stop_signal = Arc::new(AtomicBool::new(false));
 
         // Start window capture thread that feeds frames to ffmpeg
@@ -265,14 +391,16 @@ pub fn start_ffmpeg_for_window(
         let fps_u64 = fps as u64;
         let stop_signal_clone = stop_signal.clone();
 
+        // Take stdin so we can write frames
         if let Some(stdin) = child.stdin.take() {
             std::thread::spawn(move || {
-                use std::io::BufWriter;
+                info!(
+                    "Starting direct window capture for window {} at {} FPS",
+                    window_id, fps_i32
+                );
 
-                info!("Starting direct window capture for window {} at {} FPS", window_id, fps_i32);
-
+                // Fixed emission schedule based on wall clock
                 let frame_interval = Duration::from_nanos(1_000_000_000 / fps_u64);
-                // Start schedule on the next tick to avoid immediate catch-up burst
                 let mut next_due = Instant::now() + frame_interval;
 
                 let mut frame_count: u64 = 0;
@@ -284,11 +412,14 @@ pub fn start_ffmpeg_for_window(
                 if last_frame.is_none() {
                     loop {
                         if let Some((buffer, w, h)) = macos::capture_window_image(window_id) {
-                            let normalized = if w == expected_width && h == expected_height {
+                            let normalized = if w == expected_w && h == expected_h {
                                 buffer
                             } else {
-                                debug!("Initial capture {}x{} != expected {}x{}, normalizing", w, h, expected_width, expected_height);
-                                resize_rgba_nn(&buffer, w, h, expected_width, expected_height)
+                                debug!(
+                                    "Initial capture {}x{} != expected {}x{}, normalizing",
+                                    w, h, expected_w, expected_h
+                                );
+                                resize_rgba_nn(&buffer, w, h, expected_w, expected_h)
                             };
                             last_frame = Some(normalized);
                             break;
@@ -302,16 +433,15 @@ pub fn start_ffmpeg_for_window(
                 }
 
                 // Track last different source size to avoid log spam
-                let mut last_src_w: usize = expected_width;
-                let mut last_src_h: usize = expected_height;
+                let mut last_src_w: usize = expected_w;
+                let mut last_src_h: usize = expected_h;
 
                 loop {
                     if stop_signal_clone.load(Ordering::Relaxed) {
                         break;
                     }
 
-                    // 1) Emit frames due up to the current wall clock.
-                    // Use Instant::now() inside the loop to handle write blocking/back-pressure correctly.
+                    // 1) Emit frames that are due (handles back-pressure correctly)
                     while Instant::now() >= next_due {
                         if let Some(ref buf) = last_frame {
                             if let Err(e) = writer.write_all(buf) {
@@ -334,19 +464,18 @@ pub fn start_ffmpeg_for_window(
                         next_due += frame_interval;
                     }
 
-                    // 2) Try to refresh last_frame with a new capture if we're a bit ahead of schedule.
+                    // 2) Try to refresh last_frame with a new capture if we have time
                     if let Some((buffer, w, h)) = macos::capture_window_image(window_id) {
-                        if w != expected_width || h != expected_height {
-                            // Log once per source-size change
+                        if w != expected_w || h != expected_h {
                             if w != last_src_w || h != last_src_h {
                                 warn!(
                                     "Captured frame size {}x{} doesn't match expected {}x{} — normalizing",
-                                    w, h, expected_width, expected_height
+                                    w, h, expected_w, expected_h
                                 );
                                 last_src_w = w;
                                 last_src_h = h;
                             }
-                            let normalized = resize_rgba_nn(&buffer, w, h, expected_width, expected_height);
+                            let normalized = resize_rgba_nn(&buffer, w, h, expected_w, expected_h);
                             last_frame = Some(normalized);
                         } else {
                             last_frame = Some(buffer);
@@ -357,7 +486,7 @@ pub fn start_ffmpeg_for_window(
                         debug!("Window capture returned None; reusing last frame");
                     }
 
-                    // 3) Sleep a little until the next due time to avoid busy-wait.
+                    // 3) Sleep a little until the next due time to avoid busy-wait
                     let now = Instant::now();
                     if next_due > now {
                         let sleep_for = (next_due - now).min(Duration::from_millis(2));
@@ -383,8 +512,13 @@ pub fn start_ffmpeg_for_window(
             });
         }
 
-        info!("Recording {} (ID: {}) -> {}", info.window_title, info.window_id, out_path.display());
-        Ok((child, stop_signal, out_path))
+        info!(
+            "Recording {} (ID: {}) -> {}",
+            info.window_title,
+            info.window_id,
+            out_path.display()
+        );
+        return Ok((child, stop_signal, out_path));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -399,11 +533,11 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
         return Some(p);
     }
     let candidates = [
-        "/opt/homebrew/bin/ffmpeg",      // Homebrew (Apple Silicon)
-        "/usr/local/bin/ffmpeg",         // Homebrew (Intel)
-        "/sw/bin/ffmpeg",                // Fink
-        "/opt/local/bin/ffmpeg",         // MacPorts
-        "/usr/bin/ffmpeg",               // System (rare)
+        "/opt/homebrew/bin/ffmpeg", // Homebrew (Apple Silicon)
+        "/usr/local/bin/ffmpeg",    // Homebrew (Intel)
+        "/sw/bin/ffmpeg",           // Fink
+        "/opt/local/bin/ffmpeg",    // MacPorts
+        "/usr/bin/ffmpeg",          // System (rare)
     ];
     for c in candidates {
         let pb = PathBuf::from(c);
