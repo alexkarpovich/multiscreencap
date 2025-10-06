@@ -539,13 +539,16 @@ impl AppState {
             max: Pos2 { x: buttons_rect.min.x, y: row_rect.max.y },
         };
     
-        // 1) Expand/collapse icon (fixed left) - now circular
+        // 1) Expand/collapse icon (fixed left) - text only, no background/border/hover effects
         {
             ui.allocate_ui_at_rect(expand_rect, |ui| {
                 ui.with_layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
                     let preview_icon = if is_expanded { "▼" } else { "▶" };
-                    let button_size = 24.0; // Make button circular
-                    let resp = ui.add_sized(egui::vec2(button_size, button_size), egui::Button::new(preview_icon).rounding(egui::Rounding::same(button_size / 2.0)));
+                    let button_size = 24.0; // Button size for clickable area
+                    let resp = ui.add_sized(egui::vec2(button_size, button_size), egui::Button::new(preview_icon)
+                        .fill(egui::Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE)
+                        .rounding(egui::Rounding::ZERO));
                     if resp.clicked() {
                         // Toggle; keep the "single expanded" behavior you had
                         if is_expanded {
@@ -590,7 +593,20 @@ impl AppState {
             ui.allocate_ui_at_rect(buttons_rect, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if is_rec {
-                        if ui.add_sized(egui::vec2(90.0, ROW_H), egui::Button::new("⏹ Stop")).clicked() {
+                        // Create stop button with runtime and red styling
+                        let runtime_text = if let Some(start_time) = self.recording_start_times.lock().get(&window_id) {
+                            let duration = start_time.elapsed();
+                            let total_seconds = duration.as_secs();
+                            let minutes = total_seconds / 60;
+                            let seconds = total_seconds % 60;
+                            let milliseconds = duration.subsec_millis();
+                            format!("{:02}:{:02}.{:03}", minutes, seconds, milliseconds)
+                        } else {
+                            "00:00.000".to_string()
+                        };
+                        
+                        let stop_button_text = format!("⏹ Stop\n{}", runtime_text);
+                        if ui.add_sized(egui::vec2(90.0, ROW_H), egui::Button::new(stop_button_text).fill(egui::Color32::from_rgb(220, 53, 69))).clicked() {
                             to_stop.push(window_id);
                         }
                     } else {
