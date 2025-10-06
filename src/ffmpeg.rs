@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -13,9 +13,10 @@ use crate::window::WindowInfo;
 #[cfg(target_os = "macos")]
 use crate::macos;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VideoEncoder {
     H264VideoToolbox,
+    H264VideoToolboxFallback,
     Libx264,
     // You can add ProRes/HEVC variants if you want different tradeoffs.
 }
@@ -81,16 +82,52 @@ impl FfmpegCommandBuilder {
 
         match self.encoder {
             VideoEncoder::H264VideoToolbox => {
+                // Ensure bitrate is within VideoToolbox limits and dimensions are valid
+                let safe_bitrate = self.bitrate_kbps.min(50000).max(500);
+                // Ensure dimensions are even numbers (required by VideoToolbox)
+                let safe_width = if self.width % 2 == 0 { self.width } else { self.width - 1 };
+                let safe_height = if self.height % 2 == 0 { self.height } else { self.height - 1 };
+                
                 cmd.arg("-c:v")
                     .arg("h264_videotoolbox")
                     .arg("-b:v")
-                    .arg(format!("{}k", self.bitrate_kbps))
+                    .arg(format!("{}k", safe_bitrate))
                     .arg("-maxrate")
-                    .arg(format!("{}k", self.bitrate_kbps + 1000))
+                    .arg(format!("{}k", safe_bitrate + 1000))
                     .arg("-bufsize")
-                    .arg(format!("{}k", self.bitrate_kbps * 2))
+                    .arg(format!("{}k", safe_bitrate * 2))
                     .arg("-g")
-                    .arg(format!("{}", self.fps * 2));
+                    .arg(format!("{}", self.fps * 2))
+                    .arg("-profile:v")
+                    .arg("high")
+                    .arg("-level")
+                    .arg("4.1")
+                    .arg("-allow_sw")
+                    .arg("1")
+                    .arg("-realtime")
+                    .arg("1")
+                    .arg("-s")
+                    .arg(format!("{}x{}", safe_width, safe_height));
+            }
+            VideoEncoder::H264VideoToolboxFallback => {
+                // More conservative VideoToolbox settings
+                let safe_bitrate = self.bitrate_kbps.min(20000).max(1000);
+                // Ensure dimensions are even numbers (required by VideoToolbox)
+                let safe_width = if self.width % 2 == 0 { self.width } else { self.width - 1 };
+                let safe_height = if self.height % 2 == 0 { self.height } else { self.height - 1 };
+                
+                cmd.arg("-c:v")
+                    .arg("h264_videotoolbox")
+                    .arg("-b:v")
+                    .arg(format!("{}k", safe_bitrate))
+                    .arg("-profile:v")
+                    .arg("main")
+                    .arg("-level")
+                    .arg("3.1")
+                    .arg("-allow_sw")
+                    .arg("1")
+                    .arg("-s")
+                    .arg(format!("{}x{}", safe_width, safe_height));
             }
             VideoEncoder::Libx264 => {
                 cmd.arg("-c:v")
@@ -150,6 +187,27 @@ fn spawn_ffmpeg_checked(
         .with_context(|| "failed to spawn ffmpeg")?;
 
     Ok(child)
+}
+
+/// Check if ffmpeg process failed due to VideoToolbox encoder issues
+fn is_videotoolbox_error(child: &mut Child) -> bool {
+    if let Ok(Some(status)) = child.try_wait() {
+        if !status.success() {
+            // Check stderr for VideoToolbox-specific errors
+            if let Some(stderr) = child.stderr.as_mut() {
+                let mut stderr_content = String::new();
+                if std::io::Read::read_to_string(stderr, &mut stderr_content).is_ok() {
+                    return stderr_content.contains("h264_videotoolbox") && 
+                           (stderr_content.contains("-12903") || 
+                            stderr_content.contains("-12902") ||
+                            stderr_content.contains("cannot create compression session") ||
+                            stderr_content.contains("cannot prepare encoder") ||
+                            stderr_content.contains("Error while opening encoder"));
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Send quit signal to ffmpeg and wait for it to exit
@@ -281,6 +339,7 @@ pub fn start_ffmpeg_for_window(
     bitrate_kbps: i32,
     output_dir: Option<&PathBuf>,
     custom_filename: Option<&str>,
+    config: &crate::recorder::RecordingConfig,
 ) -> Result<(Child, Arc<AtomicBool>, PathBuf)> {
     let out_path = build_output_path(info, output_dir, custom_filename)?;
     info!(
@@ -329,8 +388,8 @@ pub fn start_ffmpeg_for_window(
             }
         }
 
-        // Try hardware encoder first
-        let mut encoder = VideoEncoder::H264VideoToolbox;
+        // Use encoder from config
+        let mut encoder = config.encoder;
         let mut child = spawn_ffmpeg_checked(
             ffmpeg,
             expected_w,
@@ -342,7 +401,7 @@ pub fn start_ffmpeg_for_window(
         )
         .context("failed to spawn ffmpeg (hardware)")?;
 
-        // If ffmpeg exits early, fall back to libx264
+        // If ffmpeg exits early or has VideoToolbox errors, fall back to libx264
         thread::sleep(Duration::from_millis(250));
         if let Ok(Some(status)) = child.try_wait() {
             error!("Hardware encoder process exited immediately: {:?}", status);
@@ -361,6 +420,47 @@ pub fn start_ffmpeg_for_window(
                 "Using software encoder (libx264) for window {}",
                 info.window_id
             );
+        } else if is_videotoolbox_error(&mut child) {
+            error!("VideoToolbox encoder failed, trying fallback configuration");
+            // Kill the failed process
+            let _ = child.kill();
+            encoder = VideoEncoder::H264VideoToolboxFallback;
+            child = spawn_ffmpeg_checked(
+                ffmpeg,
+                expected_w,
+                expected_h,
+                fps,
+                bitrate_kbps,
+                &out_path,
+                encoder,
+            )
+            .context("failed to spawn ffmpeg (VideoToolbox fallback)")?;
+            
+            // Check if fallback also fails
+            thread::sleep(Duration::from_millis(250));
+            if let Ok(Some(status)) = child.try_wait() {
+                error!("VideoToolbox fallback also failed: {:?}, using libx264", status);
+                encoder = VideoEncoder::Libx264;
+                child = spawn_ffmpeg_checked(
+                    ffmpeg,
+                    expected_w,
+                    expected_h,
+                    fps,
+                    bitrate_kbps,
+                    &out_path,
+                    encoder,
+                )
+                .context("failed to spawn ffmpeg (libx264 fallback)")?;
+                info!(
+                    "Using software encoder (libx264) for window {}",
+                    info.window_id
+                );
+            } else {
+                info!(
+                    "Using VideoToolbox fallback encoder for window {}",
+                    info.window_id
+                );
+            }
         } else {
             info!("Hardware encoder started OK for window {}", info.window_id);
         }

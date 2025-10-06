@@ -108,6 +108,13 @@ struct WindowRecordingSettings {
 }
 
 
+// Tab selection enum
+#[derive(PartialEq, Clone, Copy)]
+enum Tab {
+    Windows,
+    Settings,
+}
+
 // Application state
 struct AppState {
     window_manager: WindowManager,
@@ -121,6 +128,7 @@ struct AppState {
     window_settings: HashMap<u64, WindowRecordingSettings>, // Per-window overrides
     starting_recordings: Arc<Mutex<HashMap<u64, bool>>>, // Track which windows are starting
     recording_start_times: Arc<Mutex<HashMap<u64, std::time::Instant>>>, // Track recording start times
+    selected_tab: Tab, // Current tab selection
 }
 
 impl Default for AppState {
@@ -146,11 +154,154 @@ impl Default for AppState {
             window_settings: HashMap::new(),
             starting_recordings: Arc::new(Mutex::new(HashMap::new())),
             recording_start_times: Arc::new(Mutex::new(HashMap::new())),
+            selected_tab: Tab::Windows, // Default to Windows tab
         }
     }
 }
 
 impl AppState {
+    fn render_settings_tab(&mut self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            ui.heading("Recording Settings");
+            ui.add_space(10.0);
+            
+            // Output directory setting
+            ui.horizontal(|ui| {
+                ui.label("📂 Output Directory:");
+                if let Some(dir) = &self.config.output_dir {
+                    ui.label(egui::RichText::new(dir.display().to_string()).small());
+                } else {
+                    ui.label(egui::RichText::new("(not set)").small().italics());
+                }
+                if ui.button("📁 Browse").clicked() {
+                    let initial = self.config.output_dir.clone();
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_directory(initial.unwrap_or_else(|| PathBuf::from(".")))
+                        .pick_folder() {
+                        self.config.output_dir = Some(path);
+                    }
+                }
+            });
+            
+            ui.add_space(10.0);
+            
+            // FPS setting
+            ui.horizontal(|ui| {
+                ui.label("FPS:");
+                ui.add(egui::DragValue::new(&mut self.config.fps).range(1..=120));
+                ui.label("frames per second");
+            });
+            
+            ui.add_space(10.0);
+            
+            // Bitrate setting
+            ui.horizontal(|ui| {
+                ui.label("Bitrate:");
+                ui.add(egui::DragValue::new(&mut self.config.bitrate_kbps).range(500..=50000));
+                ui.label("kbps");
+            });
+            
+            ui.add_space(10.0);
+            
+            // Encoder selection
+            ui.horizontal(|ui| {
+                ui.label("Encoder:");
+                egui::ComboBox::from_id_salt("encoder_select")
+                    .selected_text(match self.config.encoder {
+                        ffmpeg::VideoEncoder::H264VideoToolbox => "H.264 VideoToolbox (Hardware)",
+                        ffmpeg::VideoEncoder::H264VideoToolboxFallback => "H.264 VideoToolbox (Fallback)",
+                        ffmpeg::VideoEncoder::Libx264 => "H.264 libx264 (Software)",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.config.encoder, ffmpeg::VideoEncoder::Libx264, "H.264 libx264 (Software)");
+                        ui.selectable_value(&mut self.config.encoder, ffmpeg::VideoEncoder::H264VideoToolbox, "H.264 VideoToolbox (Hardware)");
+                        ui.selectable_value(&mut self.config.encoder, ffmpeg::VideoEncoder::H264VideoToolboxFallback, "H.264 VideoToolbox (Fallback)");
+                    });
+            });
+            
+            ui.add_space(20.0);
+            
+            // ffmpeg status
+            ui.horizontal(|ui| {
+                if self.ffmpeg_path.is_none() {
+                    ui.colored_label(egui::Color32::RED, "⚠ ffmpeg not found");
+                    ui.label("Install via Homebrew: brew install ffmpeg");
+                } else {
+                    ui.colored_label(egui::Color32::GREEN, "✓ ffmpeg found");
+                    if let Some(path) = &self.ffmpeg_path {
+                        ui.label(egui::RichText::new(path.display().to_string()).small());
+                    }
+                }
+            });
+            
+            ui.add_space(20.0);
+            
+            // Permissions status
+            #[cfg(target_os = "macos")]
+            {
+                ui.horizontal(|ui| {
+                    if !self.has_permissions {
+                        ui.colored_label(egui::Color32::RED, "⚠ Screen recording permission required");
+                        if ui.button("🔐 Grant Access").clicked() {
+                            let granted = macos::request_screen_capture_access();
+                            self.has_permissions = granted;
+                            if !granted {
+                                self.status = "Permission denied. Enable in System Settings > Privacy & Security > Screen Recording.".to_string();
+                            } else {
+                                self.status = "Permission granted.".to_string();
+                                self.refresh_windows();
+                            }
+                        }
+                    } else {
+                        ui.colored_label(egui::Color32::GREEN, "✓ Screen recording permission granted");
+                    }
+                });
+            }
+        });
+    }
+    
+    fn render_windows_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut to_start: Vec<u64> = Vec::new();
+        let mut to_stop: Vec<u64> = Vec::new();
+        
+        // Grid view with expandable inline previews - use full width and height
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false]) // Don't auto-shrink horizontally or vertically
+            .show(ui, |ui| {
+            let mut windows: Vec<_> = self.window_manager.windows().iter().cloned().collect();
+            // Sort windows by window_id for consistent ordering
+            windows.sort_by_key(|w| w.window_id);
+            
+            if windows.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("No windows found. Click 'Refresh windows' to scan again.");
+                });
+            } else {
+                // Use full available width and height
+                let available_width = ui.available_width();
+                let available_height = ui.available_height();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(available_width, available_height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        for window in &windows {
+                            let is_rec = self.recorder.lock().is_recording(window.window_id);
+                            self.render_window_with_expanded_content(ui, ctx, window, is_rec, &mut to_start, &mut to_stop);
+                        }
+                    }
+                );
+            }
+        });
+
+        for id in to_start {
+            self.start_for_window(id);
+        }
+        
+        for id in to_stop {
+            self.stop_for_window(id);
+        }
+    }
+    
     fn render_window_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -163,77 +314,96 @@ impl AppState {
         let window_id = window.window_id;
         let is_expanded = self.expanded_previews.get(&window_id).copied().unwrap_or(false);
         
-        // Main row with window info and action buttons
+        // Window row: |fixed expand icon|stretching content|fixed action buttons|
         ui.horizontal(|ui| {
-            // Preview toggle button
-            let preview_icon = if is_expanded { "▼" } else { "▶" };
-            if ui.button(preview_icon).clicked() {
-                self.expanded_previews.insert(window_id, !is_expanded);
-            }
+            // 1. Fixed expand icon (30px width)
+            ui.allocate_ui_with_layout(
+                egui::vec2(30.0, ui.available_height()),
+                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                |ui| {
+                    let preview_icon = if is_expanded { "▼" } else { "▶" };
+                    if ui.button(preview_icon).clicked() {
+                        if is_expanded {
+                            // If currently expanded, close it
+                            self.expanded_previews.remove(&window_id);
+                        } else {
+                            // If currently closed, close all others and open this one
+                            self.expanded_previews.clear();
+                            self.expanded_previews.insert(window_id, true);
+                        }
+                    }
+                }
+            );
             
-            // Window info section (left side) - takes available space
-            ui.vertical(|ui| {
-                // Window name and dimensions
-                ui.horizontal(|ui| {
-                    ui.label(window.display_name());
-                    ui.label(egui::RichText::new(format!("({})", window.dimensions_str()))
-                        .small()
-                        .color(ui.style().visuals.weak_text_color()));
-                });
-                
-                // Status/state information right under window name
-                let is_starting = self.starting_recordings.lock().get(&window_id).copied().unwrap_or(false);
-                
-                if is_starting {
+            // 2. Stretching content with window name (fills remaining space)
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.vertical(|ui| {
+                    // Window name and dimensions - use full width
                     ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.colored_label(egui::Color32::YELLOW, "Starting...");
+                        // Window name with ellipsis truncation - takes remaining space
+                        ui.label(window.display_name());
+                        
+                        // Dimensions text - fixed size
+                        ui.label(egui::RichText::new(format!("({})", window.dimensions_str()))
+                            .small()
+                            .color(ui.style().visuals.weak_text_color()));
                     });
-                } else if is_rec {
-                    // Show recording time with real-time updates
-                    if let Some(start_time) = self.recording_start_times.lock().get(&window_id) {
-                        let duration = start_time.elapsed();
-                        let total_seconds = duration.as_secs();
-                        let minutes = total_seconds / 60;
-                        let seconds = total_seconds % 60;
-                        let milliseconds = duration.subsec_millis();
+                    
+                    // Status information
+                    let is_starting = self.starting_recordings.lock().get(&window_id).copied().unwrap_or(false);
+                    
+                    if is_starting {
                         ui.horizontal(|ui| {
-                            ui.colored_label(egui::Color32::GREEN, "● REC");
-                            ui.label(egui::RichText::new(format!("{:02}:{:02}.{:03}", minutes, seconds, milliseconds))
-                                .color(egui::Color32::GREEN)
-                                .monospace());
+                            ui.spinner();
+                            ui.colored_label(egui::Color32::YELLOW, "Starting...");
                         });
+                    } else if is_rec {
+                        // Show recording time
+                        if let Some(start_time) = self.recording_start_times.lock().get(&window_id) {
+                            let duration = start_time.elapsed();
+                            let total_seconds = duration.as_secs();
+                            let minutes = total_seconds / 60;
+                            let seconds = total_seconds % 60;
+                            let milliseconds = duration.subsec_millis();
+                            ui.horizontal(|ui| {
+                                ui.colored_label(egui::Color32::GREEN, "● REC");
+                                ui.label(egui::RichText::new(format!("{:02}:{:02}.{:03}", minutes, seconds, milliseconds))
+                                    .color(egui::Color32::GREEN)
+                                    .monospace());
+                            });
+                        }
                     }
-                }
+                });
             });
             
-            // Use right-to-left layout to properly position buttons on the right
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Add margin from the right edge first
-                ui.add_space(10.0);
-                
-                // Action buttons fixed on the right side
-                if is_rec {
-                    if ui.button("⏹ Stop").clicked() {
-                        to_stop.push(window_id);
-                    }
-                } else {
-                    if ui.button("⏺ Start").clicked() {
-                        to_start.push(window_id);
+            // 3. Fixed area for action buttons (100px width) - pulled to the right
+            ui.allocate_ui_with_layout(
+                egui::vec2(100.0, ui.available_height()),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    ui.add_space(10.0); // 10px margin from right edge
+                    
+                    if is_rec {
+                        if ui.button("⏹ Stop").clicked() {
+                            to_stop.push(window_id);
+                        }
+                    } else {
+                        if ui.button("⏺ Start").clicked() {
+                            to_start.push(window_id);
+                        }
                     }
                 }
-            });
+            );
         });
-        
-        
-        // Expanded view: preview on left, settings on right
+    
+        // Expanded content below the fixed-height row
         if is_expanded {
+            ui.add_space(6.0);
             ui.indent("expanded", |ui| {
                 ui.horizontal(|ui| {
-                    // Left: Preview
                     let preview_width = 400.0;
                     let preview_height = 225.0;
-                    
+    
                     ui.allocate_ui_with_layout(
                         egui::vec2(preview_width, preview_height),
                         egui::Layout::centered_and_justified(egui::Direction::TopDown),
@@ -241,36 +411,37 @@ impl AppState {
                             #[cfg(target_os = "macos")]
                             {
                                 let mut cache = self.preview_cache.lock();
-                                
+    
                                 if let Some(texture) = cache.get_or_update(
                                     ctx,
                                     window_id,
-                                    || macos::capture_window_image(window_id)
+                                    || macos::capture_window_image(window_id),
                                 ) {
                                     let size = texture.size_vec2();
                                     let scale = (preview_width / size.x).min(preview_height / size.y).min(1.0);
                                     let display_size = size * scale;
-                                    
                                     ui.image((texture.id(), display_size));
                                 } else {
                                     ui.label("Failed to capture preview");
                                 }
                             }
-                            
+    
                             #[cfg(not(target_os = "macos"))]
                             {
                                 ui.label("Preview not available on this platform");
                             }
-                        }
+                        },
                     );
-                    
+    
                     ui.add_space(12.0);
-                    
-                    // Right: Settings
+    
+                    // Settings panel (unchanged)
                     ui.vertical(|ui| {
-                        let settings = self.window_settings.entry(window_id).or_insert_with(WindowRecordingSettings::default);
-                        
-                        // Custom output folder
+                        let settings = self
+                            .window_settings
+                            .entry(window_id)
+                            .or_insert_with(WindowRecordingSettings::default);
+    
                         ui.horizontal(|ui| {
                             ui.label("Output folder:");
                         });
@@ -284,16 +455,21 @@ impl AppState {
                                 ui.label(egui::RichText::new("(use default)").small().italics());
                             }
                             if ui.small_button("📁").clicked() {
-                                let initial = settings.output_folder.clone().or_else(|| self.config.output_dir.clone());
-                                if let Some(path) = rfd::FileDialog::new().set_directory(initial.unwrap_or_else(|| PathBuf::from("."))).pick_folder() {
+                                let initial = settings
+                                    .output_folder
+                                    .clone()
+                                    .or_else(|| self.config.output_dir.clone());
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_directory(initial.unwrap_or_else(|| PathBuf::from(".")))
+                                    .pick_folder()
+                                {
                                     settings.output_folder = Some(path);
                                 }
                             }
                         });
-                        
+    
                         ui.add_space(8.0);
-                        
-                        // Custom filename
+    
                         ui.horizontal(|ui| {
                             ui.label("Filename:");
                         });
@@ -301,8 +477,7 @@ impl AppState {
                             let mut filename = settings.custom_filename.clone().unwrap_or_default();
                             let response = ui.add_sized(
                                 egui::vec2(200.0, 20.0),
-                                egui::TextEdit::singleline(&mut filename)
-                                    .hint_text("auto-generated")
+                                egui::TextEdit::singleline(&mut filename).hint_text("auto-generated"),
                             );
                             if response.changed() {
                                 if filename.is_empty() {
@@ -316,7 +491,214 @@ impl AppState {
                 });
             });
         }
-        
+    
+        ui.separator();
+    }
+    
+    fn render_window_with_expanded_content(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        window: &window::WindowInfo,
+        is_rec: bool,
+        to_start: &mut Vec<u64>,
+        to_stop: &mut Vec<u64>,
+    ) {
+        use egui::{Pos2, Rect};
+    
+        let window_id = window.window_id;
+        let is_expanded = self.expanded_previews.get(&window_id).copied().unwrap_or(false);
+    
+        // Fixed metrics
+        const EXPAND_W: f32 = 30.0;    // expand/collapse icon area width
+        const BUTTONS_W: f32 = 120.0;  // start/stop buttons area width
+        const ROW_H: f32 = 32.0;       // row height
+    
+        // Allocate entire row once; split into explicit sub-rects to avoid layout drift
+        let row_resp = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::hover());
+        let row_rect = row_resp.0;
+    
+        // Optional: paint a subtle background for the row
+        ui.painter().rect_filled(
+            row_rect,
+            0.0,
+            egui::Color32::from_rgb(240, 248, 255),
+        );
+    
+        // Left fixed rect (expand icon)
+        let expand_rect = Rect {
+            min: row_rect.min,
+            max: Pos2 { x: row_rect.min.x + EXPAND_W, y: row_rect.max.y },
+        };
+    
+        // Right fixed rect (buttons)
+        let buttons_rect = Rect {
+            min: Pos2 { x: row_rect.max.x - BUTTONS_W, y: row_rect.min.y },
+            max: row_rect.max,
+        };
+    
+        // Middle fill rect (between expand and buttons)
+        let mid_rect = Rect {
+            min: Pos2 { x: expand_rect.max.x, y: row_rect.min.y },
+            max: Pos2 { x: buttons_rect.min.x, y: row_rect.max.y },
+        };
+    
+        // 1) Expand/collapse icon (fixed left)
+        {
+            ui.allocate_ui_at_rect(expand_rect, |ui| {
+                ui.with_layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+                    let preview_icon = if is_expanded { "▼" } else { "▶" };
+                    let resp = ui.add_sized(egui::vec2(EXPAND_W, ROW_H), egui::Button::new(preview_icon));
+                    if resp.clicked() {
+                        // Toggle; keep the "single expanded" behavior you had
+                        if is_expanded {
+                            self.expanded_previews.remove(&window_id);
+                        } else {
+                            self.expanded_previews.clear();
+                            self.expanded_previews.insert(window_id, true);
+                        }
+                    }
+                });
+            });
+        }
+    
+        // 2) Middle: name and dimensions (vertical layout)
+        {
+            // Name and dimensions rect (full middle area)
+            let name_dims_rect = mid_rect;
+
+            // Name and dimensions: vertical layout, left-aligned
+            {
+                ui.allocate_ui_at_rect(name_dims_rect, |ui| {
+                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        // Window name: left-aligned, non-wrapping, truncates with ellipsis
+                        let name_label = egui::Label::new(egui::RichText::new(window.display_name()))
+                            .truncate();
+                        ui.add(name_label);
+                        
+                        // Dimensions: left-aligned, smaller text
+                        let dims_text = format!("({})", window.dimensions_str());
+                        ui.label(
+                            egui::RichText::new(dims_text)
+                                .small()
+                                .color(ui.style().visuals.weak_text_color()),
+                        );
+                    });
+                });
+            }
+        }
+    
+        // 3) Buttons: fixed area, flush right
+        {
+            ui.allocate_ui_at_rect(buttons_rect, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if is_rec {
+                        if ui.add_sized(egui::vec2(90.0, ROW_H), egui::Button::new("⏹ Stop")).clicked() {
+                            to_stop.push(window_id);
+                        }
+                    } else {
+                        if ui.add_sized(egui::vec2(90.0, ROW_H), egui::Button::new("⏺ Start")).clicked() {
+                            to_start.push(window_id);
+                        }
+                    }
+                });
+            });
+        }
+    
+        // Expanded content below fixed-height row
+        if is_expanded {
+            ui.add_space(6.0);
+            ui.indent("expanded", |ui| {
+                ui.horizontal(|ui| {
+                    let preview_width = 400.0;
+                    let preview_height = 225.0;
+    
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(preview_width, preview_height),
+                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                        |ui| {
+                            #[cfg(target_os = "macos")]
+                            {
+                                let mut cache = self.preview_cache.lock();
+                                if let Some(texture) = cache.get_or_update(
+                                    ctx,
+                                    window_id,
+                                    || macos::capture_window_image(window_id),
+                                ) {
+                                    let size = texture.size_vec2();
+                                    let scale = (preview_width / size.x).min(preview_height / size.y).min(1.0);
+                                    let display_size = size * scale;
+                                    ui.image((texture.id(), display_size));
+                                } else {
+                                    ui.label("Failed to capture preview");
+                                }
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                ui.label("Preview not available on this platform");
+                            }
+                        },
+                    );
+    
+                    ui.add_space(12.0);
+    
+                    // Settings (unchanged)
+                    ui.vertical(|ui| {
+                        let settings = self
+                            .window_settings
+                            .entry(window_id)
+                            .or_insert_with(WindowRecordingSettings::default);
+    
+                        ui.horizontal(|ui| {
+                            ui.label("Output folder:");
+                        });
+                        ui.horizontal(|ui| {
+                            if let Some(folder) = &settings.output_folder {
+                                ui.label(egui::RichText::new(folder.display().to_string()).small());
+                                if ui.small_button("❌").clicked() {
+                                    settings.output_folder = None;
+                                }
+                            } else {
+                                ui.label(egui::RichText::new("(use default)").small().italics());
+                            }
+                            if ui.small_button("📁").clicked() {
+                                let initial = settings
+                                    .output_folder
+                                    .clone()
+                                    .or_else(|| self.config.output_dir.clone());
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_directory(initial.unwrap_or_else(|| PathBuf::from(".")))
+                                    .pick_folder()
+                                {
+                                    settings.output_folder = Some(path);
+                                }
+                            }
+                        });
+    
+                        ui.add_space(8.0);
+    
+                        ui.horizontal(|ui| {
+                            ui.label("Filename:");
+                        });
+                        ui.horizontal(|ui| {
+                            let mut filename = settings.custom_filename.clone().unwrap_or_default();
+                            let response = ui.add_sized(
+                                egui::vec2(200.0, 20.0),
+                                egui::TextEdit::singleline(&mut filename).hint_text("auto-generated"),
+                            );
+                             if response.changed() {
+                                 settings.custom_filename = if filename.is_empty() {
+                                     None
+                                 } else {
+                                     Some(filename)
+                                 };
+                             }
+                        });
+                    });
+                });
+            });
+        }
+    
         ui.separator();
     }
     
@@ -365,8 +747,9 @@ impl AppState {
             let starting = self.starting_recordings.clone();
             
             // Start in background thread to avoid blocking UI
+            let config = self.config.clone();
             std::thread::spawn(move || {
-                match start_ffmpeg_for_window(&ffmpeg, &info, fps, bitrate, output_dir.as_ref(), custom_filename.as_deref()) {
+                match start_ffmpeg_for_window(&ffmpeg, &info, fps, bitrate, output_dir.as_ref(), custom_filename.as_deref(), &config) {
                     Ok((child, stop_signal, _output_path)) => {
                         rec.lock().start_recording(window_id, child, stop_signal);
                         
@@ -389,30 +772,44 @@ impl AppState {
 
     fn stop_all(&mut self) {
         let mut rec = self.recorder.lock();
-        for (mut child, stop_signal) in rec.stop_all() {
-                stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
-                let _ = send_quit_and_wait(&mut child);
-        }
+        let recordings_to_stop = rec.stop_all();
         
-        // Clean up all recording start times
+        // Clean up all recording start times immediately
         self.recording_start_times.lock().clear();
         
-        self.status = "Stopped all recordings".to_string();
+        self.status = "Stopping all recordings...".to_string();
+        
+        // Stop recordings in background thread to avoid blocking UI
+        if !recordings_to_stop.is_empty() {
+            std::thread::spawn(move || {
+                for (mut child, stop_signal) in recordings_to_stop {
+                    stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = send_quit_and_wait(&mut child);
+                }
+                info!("All recordings stopped");
+            });
+        }
     }
 
     fn stop_for_window(&mut self, id: u64) {
         let mut rec = self.recorder.lock();
-        if let Some((mut child, stop_signal)) = rec.stop_recording(id) {
-            stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = send_quit_and_wait(&mut child);
-            
-            // Wait a bit for ffmpeg to fully finalize the file
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            
-            // Clean up recording start time
+        if let Some((child, stop_signal)) = rec.stop_recording(id) {
+            // Clean up recording start time immediately
             self.recording_start_times.lock().remove(&id);
             
-            self.status = format!("Stopped recording for window {}", id);
+            self.status = format!("Stopping recording for window {}...", id);
+            
+            // Stop recording in background thread to avoid blocking UI
+            std::thread::spawn(move || {
+                stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                let mut child = child;
+                let _ = send_quit_and_wait(&mut child);
+                
+                // Wait a bit for ffmpeg to fully finalize the file
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                
+                info!("Stopped recording for window {}", id);
+            });
         }
     }
 }
@@ -430,35 +827,10 @@ impl eframe::App for AppState {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Toolbar
+            // Top toolbar with global actions
             ui.horizontal(|ui| {
-                #[cfg(target_os = "macos")]
-                {
-                    if !self.has_permissions {
-                        if ui.button("🔐 Grant Access").clicked() {
-                            let granted = macos::request_screen_capture_access();
-                            self.has_permissions = granted;
-                            if !granted {
-                                self.status = "Permission denied. Enable in System Settings > Privacy & Security > Screen Recording.".to_string();
-                            } else {
-                                self.status = "Permission granted.".to_string();
-                                self.refresh_windows();
-                            }
-                        }
-                    }
-                }
-                
                 if ui.button("⏹ Stop All").clicked() {
                     self.stop_all();
-                }
-                
-                ui.separator();
-                
-                if ui.button("📁 Output Folder…").clicked() {
-                    let initial = self.config.output_dir.clone();
-                    if let Some(path) = rfd::FileDialog::new().set_directory(initial.unwrap_or_else(|| PathBuf::from("."))).pick_folder() {
-                        self.config.output_dir = Some(path);
-                    }
                 }
                 
                 ui.separator();
@@ -469,54 +841,24 @@ impl eframe::App for AppState {
                 }
             });
 
-            // Settings in compact horizontal layout
+            ui.separator();
+
+            // Tab bar
             ui.horizontal(|ui| {
-                ui.label("📂");
-                if let Some(dir) = &self.config.output_dir {
-                    ui.label(egui::RichText::new(dir.display().to_string()).small());
-                } else {
-                    ui.label(egui::RichText::new("(not set)").small());
-                }
-                
-                ui.separator();
-                
-                ui.label("FPS:");
-                ui.add(egui::DragValue::new(&mut self.config.fps).range(1..=120));
-                
-                ui.label("Bitrate:");
-                ui.add(egui::DragValue::new(&mut self.config.bitrate_kbps).range(500..=50000));
-                ui.label("kbps");
+                ui.selectable_value(&mut self.selected_tab, Tab::Windows, "Windows");
+                ui.selectable_value(&mut self.selected_tab, Tab::Settings, "Settings");
             });
 
             ui.separator();
 
-            let mut to_start: Vec<u64> = Vec::new();
-            let mut to_stop: Vec<u64> = Vec::new();
-            
-            // List view with expandable inline previews
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut windows: Vec<_> = self.window_manager.windows().iter().cloned().collect();
-                // Sort windows by window_id for consistent ordering
-                windows.sort_by_key(|w| w.window_id);
-                
-                for window in &windows {
-                    let is_rec = self.recorder.lock().is_recording(window.window_id);
-                    self.render_window_row(ui, ctx, window, is_rec, &mut to_start, &mut to_stop);
+            // Tab content
+            match self.selected_tab {
+                Tab::Windows => {
+                    self.render_windows_tab(ui, ctx);
                 }
-                
-                if windows.is_empty() {
-                    ui.centered_and_justified(|ui| {
-                        ui.label("No windows found. Click 'Refresh windows' to scan again.");
-                    });
+                Tab::Settings => {
+                    self.render_settings_tab(ui);
                 }
-            });
-
-            for id in to_start {
-                self.start_for_window(id);
-            }
-            
-            for id in to_stop {
-                self.stop_for_window(id);
             }
         });
         

@@ -20,8 +20,7 @@ pub struct WindowInfo {
 impl WindowInfo {
     pub fn display_name(&self) -> String {
         format!(
-            "[{}] {} — {}",
-            self.window_id,
+            "{} — {}",
             self.owner_name,
             if self.window_title.is_empty() { "(untitled)" } else { &self.window_title }
         )

@@ -4,11 +4,15 @@ use std::process::Child;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use crate::ffmpeg::VideoEncoder;
+
 /// Configuration for recording
+#[derive(Clone)]
 pub struct RecordingConfig {
     pub fps: i32,
     pub bitrate_kbps: i32,
     pub output_dir: Option<PathBuf>,
+    pub encoder: VideoEncoder,
 }
 
 impl RecordingConfig {
@@ -20,6 +24,7 @@ impl RecordingConfig {
             fps: 30,
             bitrate_kbps: 6000,
             output_dir: default_dir,
+            encoder: VideoEncoder::Libx264, // Default to software encoder for reliability
         }
     }
 }

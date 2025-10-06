@@ -3,7 +3,9 @@
 <plist version="1.0">
 <dict>
     <key>NSCameraUseContinuityCameraDeviceType</key>
-    <true/>
+    <array>
+        <string>AVCaptureDeviceTypeContinuityCamera</string>
+    </array>
     <key>NSMicrophoneUsageDescription</key>
     <string>This app needs microphone access to record audio with screen recordings.</string>
     <key>NSCameraUsageDescription</key>
