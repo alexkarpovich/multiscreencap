@@ -13,6 +13,8 @@ pub struct RecordingConfig {
     pub bitrate_kbps: i32,
     pub output_dir: Option<PathBuf>,
     pub encoder: VideoEncoder,
+    pub audio_input_device: Option<String>, // Audio input device ID
+    pub audio_enabled: bool, // Whether to record audio
 }
 
 impl RecordingConfig {
@@ -25,6 +27,8 @@ impl RecordingConfig {
             bitrate_kbps: 6000,
             output_dir: default_dir,
             encoder: VideoEncoder::Libx264, // Default to software encoder for reliability
+            audio_input_device: None,
+            audio_enabled: false, // Default to no audio recording
         }
     }
 }

@@ -1,6 +1,7 @@
 mod window;
 mod recorder;
 mod ffmpeg;
+mod audio;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -17,6 +18,7 @@ use tracing::{error, info};
 use window::WindowManager;
 use recorder::{RecorderState, RecordingConfig};
 use ffmpeg::{find_ffmpeg, start_ffmpeg_for_window, send_quit_and_wait};
+use audio::AudioDeviceManager;
 
 // Cache for window preview textures with throttling
 struct PreviewCache {
@@ -129,6 +131,8 @@ struct AppState {
     starting_recordings: Arc<Mutex<HashMap<u64, bool>>>, // Track which windows are starting
     recording_start_times: Arc<Mutex<HashMap<u64, std::time::Instant>>>, // Track recording start times
     selected_tab: Tab, // Current tab selection
+    audio_device_manager: AudioDeviceManager,
+    selected_audio_device: Option<String>, // Selected audio input device ID
 }
 
 impl Default for AppState {
@@ -136,6 +140,31 @@ impl Default for AppState {
         let ffmpeg_path = find_ffmpeg();
         let mut window_manager = WindowManager::new();
         let _ = window_manager.refresh();
+        
+        // Initialize audio device manager and select default device
+        let mut audio_device_manager = AudioDeviceManager::new();
+        let selected_audio_device = match audio_device_manager.enumerate_devices() {
+            Ok(devices) => {
+                // Find the default device or use the first one
+                let device_id = devices.iter()
+                    .find(|d| d.is_default)
+                    .or_else(|| devices.first())
+                    .map(|d| d.id.clone());
+                
+                // Start monitoring the selected device
+                if let Some(ref device_id) = device_id {
+                    if let Err(e) = audio_device_manager.start_level_monitoring(device_id) {
+                        eprintln!("Failed to start audio level monitoring for {}: {}", device_id, e);
+                    }
+                }
+                
+                device_id
+            }
+            Err(e) => {
+                eprintln!("Failed to enumerate audio devices: {}", e);
+                None
+            }
+        };
         
         Self {
             window_manager,
@@ -155,11 +184,68 @@ impl Default for AppState {
             starting_recordings: Arc::new(Mutex::new(HashMap::new())),
             recording_start_times: Arc::new(Mutex::new(HashMap::new())),
             selected_tab: Tab::Windows, // Default to Windows tab
+            audio_device_manager,
+            selected_audio_device,
         }
     }
 }
 
 impl AppState {
+    fn select_audio_device(&mut self, device_id: String) {
+        // Stop monitoring previous device
+        if let Some(ref old_device_id) = self.selected_audio_device {
+            if old_device_id != &device_id {
+                self.audio_device_manager.stop_level_monitoring(old_device_id);
+            }
+        }
+        
+        // Update selection
+        self.selected_audio_device = Some(device_id.clone());
+        
+        // Start monitoring new device
+        if let Err(e) = self.audio_device_manager.start_level_monitoring(&device_id) {
+            eprintln!("Failed to start audio level monitoring for {}: {}", device_id, e);
+        }
+    }
+    
+    fn render_audio_level_indicator(&self, ui: &mut egui::Ui, level: f32) {
+        ui.horizontal(|ui| {
+            ui.label("Level:");
+            
+            // Create 14 bars (░░░░░░░░░░░░░░) with reduced spacing
+            let bars = "░░░░░░░░░░░░░░";
+            let num_bars = bars.len();
+            let active_bars = (level * num_bars as f32).round() as usize;
+            
+            // Use a more compact layout by reducing spacing between characters
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0; // Remove horizontal spacing
+                
+                for (i, bar_char) in bars.chars().enumerate() {
+                    let color = if i < active_bars {
+                        // Color gradient from green to red
+                        if i < num_bars / 3 {
+                            egui::Color32::GREEN
+                        } else if i < 2 * num_bars / 3 {
+                            egui::Color32::YELLOW
+                        } else {
+                            egui::Color32::RED
+                        }
+                    } else {
+                        ui.style().visuals.weak_text_color()
+                    };
+                    
+                    ui.colored_label(color, bar_char.to_string());
+                }
+            });
+            
+            ui.add_space(8.0); // Small space before percentage
+            
+            // Show numeric level
+            ui.label(format!("{:.1}%", level * 100.0));
+        });
+    }
+    
     fn render_settings_tab(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
             ui.heading("Recording Settings");
@@ -218,6 +304,79 @@ impl AppState {
                         ui.selectable_value(&mut self.config.encoder, ffmpeg::VideoEncoder::H264VideoToolboxFallback, "H.264 VideoToolbox (Fallback)");
                     });
             });
+            
+            ui.add_space(20.0);
+            
+            // Audio recording toggle
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.config.audio_enabled, "🎤 Record Audio");
+                if self.config.audio_enabled {
+                    ui.colored_label(egui::Color32::GREEN, "✓ Audio will be recorded");
+                } else {
+                    ui.colored_label(egui::Color32::GRAY, "Audio recording disabled");
+                }
+            });
+            
+            if self.config.audio_enabled {
+                ui.label(egui::RichText::new("Note: Audio will be recorded from the selected audio input device above.").small().italics());
+                ui.label(egui::RichText::new("For system audio (what's playing), install BlackHole and select it as your audio device.").small().italics());
+            }
+            
+            ui.add_space(10.0);
+            
+            // Audio input device selection
+            ui.horizontal(|ui| {
+                ui.label("🎤 Audio Input:");
+                egui::ComboBox::from_id_salt("audio_input_select")
+                    .selected_text(
+                        self.selected_audio_device.as_ref()
+                            .and_then(|id| {
+                                self.audio_device_manager.get_devices()
+                                    .iter()
+                                    .find(|d| d.id == *id)
+                                    .map(|d| d.name.as_str())
+                            })
+                            .unwrap_or("No device selected")
+                    )
+                    .show_ui(ui, |ui| {
+                        // Refresh devices button
+                        if ui.button("🔄 Refresh").clicked() {
+                            if let Ok(devices) = self.audio_device_manager.enumerate_devices() {
+                                if self.selected_audio_device.is_none() && !devices.is_empty() {
+                                    // Auto-select default device if none selected
+                                    self.selected_audio_device = devices.iter()
+                                        .find(|d| d.is_default)
+                                        .or_else(|| devices.first())
+                                        .map(|d| d.id.clone());
+                                }
+                            }
+                        }
+                        
+                        ui.separator();
+                        
+                        let devices = self.audio_device_manager.get_devices().to_vec();
+                        for device in devices {
+                            let display_name = if device.is_default {
+                                format!("{} (Default)", device.name)
+                            } else {
+                                device.name.clone()
+                            };
+                            
+                            if ui.selectable_value(&mut self.selected_audio_device, Some(device.id.clone()), display_name).clicked() {
+                                self.select_audio_device(device.id.clone());
+                            }
+                        }
+                    });
+            });
+            
+            
+            // Audio level indicator
+            if let Some(device_id) = &self.selected_audio_device {
+                if let Some(monitor) = self.audio_device_manager.get_level_monitor(device_id) {
+                    let level = monitor.get_level();
+                    self.render_audio_level_indicator(ui, level);
+                }
+            }
             
             ui.add_space(20.0);
             
@@ -707,6 +866,16 @@ impl AppState {
                                  };
                              }
                         });
+                        
+                        ui.add_space(8.0);
+                        
+                        // Audio level indicator for this window
+                        if let Some(device_id) = &self.selected_audio_device {
+                            if let Some(monitor) = self.audio_device_manager.get_level_monitor(device_id) {
+                                let level = monitor.get_level();
+                                self.render_audio_level_indicator(ui, level);
+                            }
+                        }
                     });
                 });
             });
@@ -760,7 +929,14 @@ impl AppState {
             let starting = self.starting_recordings.clone();
             
             // Start in background thread to avoid blocking UI
-            let config = self.config.clone();
+            let mut config = self.config.clone();
+            // Set audio configuration from the selected device
+            config.audio_input_device = if self.config.audio_enabled {
+                self.selected_audio_device.clone()
+            } else {
+                None
+            };
+            
             std::thread::spawn(move || {
                 match start_ffmpeg_for_window(&ffmpeg, &info, fps, bitrate, output_dir.as_ref(), custom_filename.as_deref(), &config) {
                     Ok((child, stop_signal, _output_path)) => {
@@ -837,6 +1013,11 @@ impl eframe::App for AppState {
         // Request UI refresh frequently when recordings are active for real-time timer updates
         if !self.recording_start_times.lock().is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        
+        // Request UI refresh when audio monitoring is active for real-time level updates
+        if self.selected_audio_device.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {

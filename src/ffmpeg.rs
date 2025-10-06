@@ -30,6 +30,8 @@ pub struct FfmpegCommandBuilder {
     bitrate_kbps: i32,
     output_path: PathBuf,
     encoder: VideoEncoder,
+    audio_input_device: Option<String>,
+    audio_enabled: bool,
 }
 
 impl FfmpegCommandBuilder {
@@ -41,6 +43,8 @@ impl FfmpegCommandBuilder {
         bitrate_kbps: i32,
         output_path: PathBuf,
         encoder: VideoEncoder,
+        audio_input_device: Option<String>,
+        audio_enabled: bool,
     ) -> Self {
         Self {
             ffmpeg_path,
@@ -50,6 +54,8 @@ impl FfmpegCommandBuilder {
             bitrate_kbps,
             output_path,
             encoder,
+            audio_input_device,
+            audio_enabled,
         }
     }
 
@@ -71,6 +77,42 @@ impl FfmpegCommandBuilder {
             .arg(format!("{}", self.fps))
             .arg("-i")
             .arg("-");
+
+        // Add audio input if enabled - this creates a second input stream
+        if self.audio_enabled {
+            // Use avfoundation on macOS for audio capture
+            #[cfg(target_os = "macos")]
+            {
+                // For macOS, map device names to ffmpeg device indices
+                let device_index = self.audio_input_device.as_ref()
+                    .and_then(|device_name| {
+                        // Map common device names to their ffmpeg indices
+                        match device_name.as_str() {
+                            "Microsoft Teams Audio" => Some(0),
+                            "External Microphone" => Some(1),
+                            "MacBook Pro Microphone" => Some(2),
+                            _ => {
+                                // Try to parse as a number, or default to 2
+                                device_name.parse::<usize>().ok().or(Some(2))
+                            }
+                        }
+                    })
+                    .unwrap_or(2); // Default to MacBook Pro Microphone
+                
+                cmd.arg("-f")
+                    .arg("avfoundation")
+                    .arg("-i")
+                    .arg(format!(":{}", device_index));
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                // For non-macOS platforms, use default audio input
+                cmd.arg("-f")
+                    .arg("pulse")
+                    .arg("-i")
+                    .arg("default");
+            }
+        }
 
         // Force CFR on output to match wall-clock emission
         cmd.arg("-vsync")
@@ -149,6 +191,29 @@ impl FfmpegCommandBuilder {
             }
         }
 
+        // Add audio codec if audio is enabled
+        if self.audio_enabled {
+            cmd.arg("-c:a")
+                .arg("aac")
+                .arg("-b:a")
+                .arg("192k") // Higher bitrate for better quality
+                .arg("-ar")
+                .arg("48000") // Higher sample rate
+                .arg("-ac")
+                .arg("2") // Stereo
+                .arg("-af")
+                .arg("highpass=f=80,lowpass=f=15000,volume=0.8") // Noise reduction and volume normalization
+                .arg("-map")
+                .arg("0:v") // Map video from first input (stdin)
+                .arg("-map")
+                .arg("1:a") // Map audio from second input (audio device)
+                .arg("-shortest"); // End when the shortest input ends
+        } else {
+            // If no audio, just map the video stream
+            cmd.arg("-map")
+                .arg("0:v");
+        }
+
         // MP4 with faststart for better compatibility
         cmd.arg("-movflags")
             .arg("faststart")
@@ -168,7 +233,16 @@ fn spawn_ffmpeg_checked(
     bitrate_kbps: i32,
     out_path: &PathBuf,
     encoder: VideoEncoder,
+    audio_input_device: Option<String>,
+    audio_enabled: bool,
 ) -> Result<Child> {
+    // Log audio configuration for debugging
+    if audio_enabled {
+        info!("Audio recording enabled with device: {:?}", audio_input_device);
+    } else {
+        info!("Audio recording disabled");
+    }
+    
     let builder = FfmpegCommandBuilder::new(
         ffmpeg.clone(),
         width,
@@ -177,14 +251,23 @@ fn spawn_ffmpeg_checked(
         bitrate_kbps,
         out_path.clone(),
         encoder,
+        audio_input_device,
+        audio_enabled,
     );
     let mut cmd = builder.build();
     info!("Executing ffmpeg command: {:?}", cmd);
+    
+    // Log the full command as a string for debugging
+    let cmd_str = format!("{:?}", cmd);
+    info!("Full ffmpeg command: {}", cmd_str);
 
     let child = cmd
         .stdin(Stdio::piped())
         .spawn()
         .with_context(|| "failed to spawn ffmpeg")?;
+    
+    // Log that ffmpeg process started
+    info!("ffmpeg process started successfully");
 
     Ok(child)
 }
@@ -218,6 +301,9 @@ pub fn send_quit_and_wait(child: &mut Child) -> Result<()> {
     if let Some(stdin) = child.stdin.take() {
         drop(stdin);
     }
+    
+    // Give ffmpeg a moment to process the EOF
+    std::thread::sleep(Duration::from_millis(100));
 
     // Wait for ffmpeg to finish processing and exit gracefully
     let start = Instant::now();
@@ -231,8 +317,8 @@ pub fn send_quit_and_wait(child: &mut Child) -> Result<()> {
                 break;
             }
             Ok(None) => {
-                if start.elapsed() > Duration::from_secs(15) {
-                    info!("ffmpeg didn't exit within 15s, force killing process");
+                if start.elapsed() > Duration::from_secs(5) {
+                    info!("ffmpeg didn't exit within 5s, force killing process");
                     let _ = child.kill();
                     let _ = child.wait();
                     break;
@@ -398,6 +484,8 @@ pub fn start_ffmpeg_for_window(
             bitrate_kbps,
             &out_path,
             encoder,
+            config.audio_input_device.clone(),
+            config.audio_enabled,
         )
         .context("failed to spawn ffmpeg (hardware)")?;
 
@@ -414,6 +502,8 @@ pub fn start_ffmpeg_for_window(
                 bitrate_kbps,
                 &out_path,
                 encoder,
+                config.audio_input_device.clone(),
+                config.audio_enabled,
             )
             .context("failed to spawn ffmpeg (libx264 fallback)")?;
             info!(
@@ -433,6 +523,8 @@ pub fn start_ffmpeg_for_window(
                 bitrate_kbps,
                 &out_path,
                 encoder,
+                config.audio_input_device.clone(),
+                config.audio_enabled,
             )
             .context("failed to spawn ffmpeg (VideoToolbox fallback)")?;
             
@@ -449,6 +541,8 @@ pub fn start_ffmpeg_for_window(
                     bitrate_kbps,
                     &out_path,
                     encoder,
+                    config.audio_input_device.clone(),
+                    config.audio_enabled,
                 )
                 .context("failed to spawn ffmpeg (libx264 fallback)")?;
                 info!(
