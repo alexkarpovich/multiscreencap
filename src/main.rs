@@ -511,6 +511,7 @@ impl AppState {
     
         // Fixed metrics
         const EXPAND_W: f32 = 30.0;    // expand/collapse icon area width
+        const SPACING_W: f32 = 10.0;   // spacing between expand button and window name
         const BUTTONS_W: f32 = 120.0;  // start/stop buttons area width
         const ROW_H: f32 = 32.0;       // row height
     
@@ -518,12 +519,7 @@ impl AppState {
         let row_resp = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::hover());
         let row_rect = row_resp.0;
     
-        // Optional: paint a subtle background for the row
-        ui.painter().rect_filled(
-            row_rect,
-            0.0,
-            egui::Color32::from_rgb(240, 248, 255),
-        );
+        // Row background removed as requested
     
         // Left fixed rect (expand icon)
         let expand_rect = Rect {
@@ -537,18 +533,19 @@ impl AppState {
             max: row_rect.max,
         };
     
-        // Middle fill rect (between expand and buttons)
+        // Middle fill rect (between expand and buttons, accounting for spacing)
         let mid_rect = Rect {
-            min: Pos2 { x: expand_rect.max.x, y: row_rect.min.y },
+            min: Pos2 { x: expand_rect.max.x + SPACING_W, y: row_rect.min.y },
             max: Pos2 { x: buttons_rect.min.x, y: row_rect.max.y },
         };
     
-        // 1) Expand/collapse icon (fixed left)
+        // 1) Expand/collapse icon (fixed left) - now circular
         {
             ui.allocate_ui_at_rect(expand_rect, |ui| {
                 ui.with_layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
                     let preview_icon = if is_expanded { "▼" } else { "▶" };
-                    let resp = ui.add_sized(egui::vec2(EXPAND_W, ROW_H), egui::Button::new(preview_icon));
+                    let button_size = 24.0; // Make button circular
+                    let resp = ui.add_sized(egui::vec2(button_size, button_size), egui::Button::new(preview_icon).rounding(egui::Rounding::same(button_size / 2.0)));
                     if resp.clicked() {
                         // Toggle; keep the "single expanded" behavior you had
                         if is_expanded {
