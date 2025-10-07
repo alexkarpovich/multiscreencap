@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 use crate::window::WindowInfo;
+use crate::audio::get_ffmpeg_device_index;
 
 #[cfg(target_os = "macos")]
 use crate::macos;
@@ -31,7 +32,6 @@ pub struct FfmpegCommandBuilder {
     output_path: PathBuf,
     encoder: VideoEncoder,
     audio_input_device: Option<String>,
-    audio_enabled: bool,
 }
 
 impl FfmpegCommandBuilder {
@@ -44,7 +44,6 @@ impl FfmpegCommandBuilder {
         output_path: PathBuf,
         encoder: VideoEncoder,
         audio_input_device: Option<String>,
-        audio_enabled: bool,
     ) -> Self {
         Self {
             ffmpeg_path,
@@ -55,7 +54,6 @@ impl FfmpegCommandBuilder {
             output_path,
             encoder,
             audio_input_device,
-            audio_enabled,
         }
     }
 
@@ -78,26 +76,16 @@ impl FfmpegCommandBuilder {
             .arg("-i")
             .arg("-");
 
-        // Add audio input if enabled - this creates a second input stream
-        if self.audio_enabled {
+        // Add audio input if device is provided - this creates a second input stream
+        if self.audio_input_device.is_some() {
             // Use avfoundation on macOS for audio capture
             #[cfg(target_os = "macos")]
             {
                 // For macOS, map device names to ffmpeg device indices
                 let device_index = self.audio_input_device.as_ref()
-                    .and_then(|device_name| {
-                        // Map common device names to their ffmpeg indices
-                        match device_name.as_str() {
-                            "Microsoft Teams Audio" => Some(0),
-                            "External Microphone" => Some(1),
-                            "MacBook Pro Microphone" => Some(2),
-                            _ => {
-                                // Try to parse as a number, or default to 2
-                                device_name.parse::<usize>().ok().or(Some(2))
-                            }
-                        }
-                    })
+                    .and_then(|device_name| get_ffmpeg_device_index(device_name))
                     .unwrap_or(2); // Default to MacBook Pro Microphone
+                
                 
                 cmd.arg("-f")
                     .arg("avfoundation")
@@ -191,8 +179,8 @@ impl FfmpegCommandBuilder {
             }
         }
 
-        // Add audio codec if audio is enabled
-        if self.audio_enabled {
+        // Add audio codec if device is provided
+        if self.audio_input_device.is_some() {
             cmd.arg("-c:a")
                 .arg("aac")
                 .arg("-b:a")
@@ -234,10 +222,9 @@ fn spawn_ffmpeg_checked(
     out_path: &PathBuf,
     encoder: VideoEncoder,
     audio_input_device: Option<String>,
-    audio_enabled: bool,
 ) -> Result<Child> {
     // Log audio configuration for debugging
-    if audio_enabled {
+    if audio_input_device.is_some() {
         info!("Audio recording enabled with device: {:?}", audio_input_device);
     } else {
         info!("Audio recording disabled");
@@ -252,7 +239,6 @@ fn spawn_ffmpeg_checked(
         out_path.clone(),
         encoder,
         audio_input_device,
-        audio_enabled,
     );
     let mut cmd = builder.build();
     info!("Executing ffmpeg command: {:?}", cmd);
@@ -485,7 +471,6 @@ pub fn start_ffmpeg_for_window(
             &out_path,
             encoder,
             config.audio_input_device.clone(),
-            config.audio_enabled,
         )
         .context("failed to spawn ffmpeg (hardware)")?;
 
@@ -503,7 +488,6 @@ pub fn start_ffmpeg_for_window(
                 &out_path,
                 encoder,
                 config.audio_input_device.clone(),
-                config.audio_enabled,
             )
             .context("failed to spawn ffmpeg (libx264 fallback)")?;
             info!(
@@ -524,7 +508,6 @@ pub fn start_ffmpeg_for_window(
                 &out_path,
                 encoder,
                 config.audio_input_device.clone(),
-                config.audio_enabled,
             )
             .context("failed to spawn ffmpeg (VideoToolbox fallback)")?;
             
@@ -542,7 +525,6 @@ pub fn start_ffmpeg_for_window(
                     &out_path,
                     encoder,
                     config.audio_input_device.clone(),
-                    config.audio_enabled,
                 )
                 .context("failed to spawn ffmpeg (libx264 fallback)")?;
                 info!(

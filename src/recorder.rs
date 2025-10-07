@@ -14,11 +14,14 @@ pub struct RecordingConfig {
     pub output_dir: Option<PathBuf>,
     pub encoder: VideoEncoder,
     pub audio_input_device: Option<String>, // Audio input device ID
-    pub audio_enabled: bool, // Whether to record audio
 }
 
 impl RecordingConfig {
     pub fn new() -> Self {
+        Self::with_audio_device(None)
+    }
+    
+    pub fn with_audio_device(audio_input_device: Option<String>) -> Self {
         // Set default output directory to current directory
         let default_dir = std::env::current_dir().ok();
         
@@ -27,8 +30,7 @@ impl RecordingConfig {
             bitrate_kbps: 6000,
             output_dir: default_dir,
             encoder: VideoEncoder::Libx264, // Default to software encoder for reliability
-            audio_input_device: None,
-            audio_enabled: false, // Default to no audio recording
+            audio_input_device,
         }
     }
 }

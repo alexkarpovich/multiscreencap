@@ -49,12 +49,21 @@ impl AudioLevelMonitor {
         // Get the default audio host
         let host = cpal::default_host();
         
-        // Find the specific device by exact name match
-        let device = host.input_devices()
-            .map_err(|e| anyhow!("Failed to enumerate input devices: {}", e))?
-            .find(|d| d.name().map(|name| name == self.device_id).unwrap_or(false))
-            .or_else(|| host.default_input_device())
-            .ok_or_else(|| anyhow!("No input device available"))?;
+        // Find the specific device by index or name match
+        let device = if let Ok(index) = self.device_id.parse::<usize>() {
+            // Use index-based lookup
+            host.input_devices()
+                .map_err(|e| anyhow!("Failed to enumerate input devices: {}", e))?
+                .nth(index)
+                .or_else(|| host.default_input_device())
+        } else {
+            // Fallback to name-based lookup for legacy compatibility
+            host.input_devices()
+                .map_err(|e| anyhow!("Failed to enumerate input devices: {}", e))?
+                .find(|d| d.name().map(|name| name == self.device_id).unwrap_or(false))
+                .or_else(|| host.default_input_device())
+        }
+        .ok_or_else(|| anyhow!("No input device available"))?;
         
         // Get the default input config
         let config = device.default_input_config()
@@ -267,25 +276,40 @@ impl AudioDeviceManager {
         // Get default device for comparison
         let default_device = host.default_input_device();
         
-        for (index, device) in input_devices.enumerate() {
-            let device_name = device.name().unwrap_or_else(|_| format!("Device {}", index));
-            let is_default = default_device.as_ref().and_then(|d| {
-                d.name().ok().and_then(|default_name| {
-                    device.name().ok().map(|device_name| device_name == default_name)
-                })
-            }).unwrap_or(false);
-            
-            devices.push(AudioDevice {
-                id: device_name.clone(),
-                name: device_name,
-                is_default,
-            });
+        // Collect all devices first
+        let cpal_devices: Vec<_> = input_devices.collect();
+        
+        // Map CPAL devices to ffmpeg indices based on known device names
+        // ffmpeg order: [0] Microsoft Teams Audio, [1] External Microphone, [2] MacBook Pro Microphone
+        let device_mappings = [
+            ("Microsoft Teams Audio", 0),
+            ("External Microphone", 1), 
+            ("MacBook Pro Microphone", 2),
+        ];
+        
+        for (device_name, ffmpeg_index) in device_mappings.iter() {
+            // Find the CPAL device with this name
+            if let Some(cpal_device) = cpal_devices.iter().find(|d| {
+                d.name().map(|name| name == *device_name).unwrap_or(false)
+            }) {
+                let is_default = default_device.as_ref().and_then(|d| {
+                    d.name().ok().and_then(|default_name| {
+                        cpal_device.name().ok().map(|device_name| device_name == default_name)
+                    })
+                }).unwrap_or(false);
+                
+                devices.push(AudioDevice {
+                    id: ffmpeg_index.to_string(),
+                    name: device_name.to_string(),
+                    is_default,
+                });
+            }
         }
         
         // If no devices found, add a fallback
         if devices.is_empty() {
             devices.push(AudioDevice {
-                id: "default".to_string(),
+                id: "0".to_string(),
                 name: "Default Audio Input".to_string(),
                 is_default: true,
             });
@@ -335,5 +359,22 @@ impl AudioDeviceManager {
 impl Default for AudioDeviceManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Get the ffmpeg device index for a given device ID
+/// This maps device IDs to their corresponding ffmpeg avfoundation indices
+pub fn get_ffmpeg_device_index(device_id: &str) -> Option<usize> {
+    // Try to parse as a number first (new index-based approach)
+    if let Ok(index) = device_id.parse::<usize>() {
+        return Some(index);
+    }
+    
+    // Fallback to legacy device name mapping for backward compatibility
+    match device_id {
+        "Microsoft Teams Audio" => Some(0),
+        "External Microphone" => Some(1),
+        "MacBook Pro Microphone" => Some(2),
+        _ => Some(0), // Default to first device
     }
 }

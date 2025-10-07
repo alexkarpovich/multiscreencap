@@ -169,7 +169,7 @@ impl Default for AppState {
         Self {
             window_manager,
             recorder: Arc::new(Mutex::new(RecorderState::new())),
-            config: RecordingConfig::new(),
+            config: RecordingConfig::with_audio_device(selected_audio_device.clone()),
             ffmpeg_path: ffmpeg_path.clone(),
             status: String::new(),
             has_permissions: {
@@ -202,6 +202,9 @@ impl AppState {
         // Update selection
         self.selected_audio_device = Some(device_id.clone());
         
+        // Update config to use the selected device
+        self.config.audio_input_device = Some(device_id.clone());
+        
         // Start monitoring new device
         if let Err(e) = self.audio_device_manager.start_level_monitoring(&device_id) {
             eprintln!("Failed to start audio level monitoring for {}: {}", device_id, e);
@@ -212,8 +215,8 @@ impl AppState {
         ui.horizontal(|ui| {
             ui.label("Level:");
             
-            // Create 14 bars (░░░░░░░░░░░░░░) with reduced spacing
-            let bars = "░░░░░░░░░░░░░░";
+            // Create 14 bars (▓▓▓▓▓▓▓▓▓▓▓▓▓▓) with reduced spacing
+            let bars = "▓▓▓▓▓▓▓▓▓▓▓▓▓▓";
             let num_bars = bars.len();
             let active_bars = (level * num_bars as f32).round() as usize;
             
@@ -306,23 +309,6 @@ impl AppState {
             });
             
             ui.add_space(20.0);
-            
-            // Audio recording toggle
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.config.audio_enabled, "🎤 Record Audio");
-                if self.config.audio_enabled {
-                    ui.colored_label(egui::Color32::GREEN, "✓ Audio will be recorded");
-                } else {
-                    ui.colored_label(egui::Color32::GRAY, "Audio recording disabled");
-                }
-            });
-            
-            if self.config.audio_enabled {
-                ui.label(egui::RichText::new("Note: Audio will be recorded from the selected audio input device above.").small().italics());
-                ui.label(egui::RichText::new("For system audio (what's playing), install BlackHole and select it as your audio device.").small().italics());
-            }
-            
-            ui.add_space(10.0);
             
             // Audio input device selection
             ui.horizontal(|ui| {
@@ -929,13 +915,7 @@ impl AppState {
             let starting = self.starting_recordings.clone();
             
             // Start in background thread to avoid blocking UI
-            let mut config = self.config.clone();
-            // Set audio configuration from the selected device
-            config.audio_input_device = if self.config.audio_enabled {
-                self.selected_audio_device.clone()
-            } else {
-                None
-            };
+            let config = self.config.clone();
             
             std::thread::spawn(move || {
                 match start_ffmpeg_for_window(&ffmpeg, &info, fps, bitrate, output_dir.as_ref(), custom_filename.as_deref(), &config) {
