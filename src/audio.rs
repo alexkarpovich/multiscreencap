@@ -265,7 +265,7 @@ impl AudioDeviceManager {
 
     #[cfg(target_os = "macos")]
     fn enumerate_macos_devices(&self) -> Result<Vec<AudioDevice>> {
-        // Use CPAL to enumerate actual devices
+        // Use CPAL devices directly for the settings tab
         let mut devices = Vec::new();
         let host = cpal::default_host();
         
@@ -276,31 +276,18 @@ impl AudioDeviceManager {
         // Get default device for comparison
         let default_device = host.default_input_device();
         
-        // Collect all devices first
-        let cpal_devices: Vec<_> = input_devices.collect();
-        
-        // Map CPAL devices to ffmpeg indices based on known device names
-        // ffmpeg order: [0] Microsoft Teams Audio, [1] External Microphone, [2] MacBook Pro Microphone
-        let device_mappings = [
-            ("Microsoft Teams Audio", 0),
-            ("External Microphone", 1), 
-            ("MacBook Pro Microphone", 2),
-        ];
-        
-        for (device_name, ffmpeg_index) in device_mappings.iter() {
-            // Find the CPAL device with this name
-            if let Some(cpal_device) = cpal_devices.iter().find(|d| {
-                d.name().map(|name| name == *device_name).unwrap_or(false)
-            }) {
+        // Collect all devices with their actual names and CPAL indices
+        for (cpal_index, cpal_device) in input_devices.enumerate() {
+            if let Ok(device_name) = cpal_device.name() {
                 let is_default = default_device.as_ref().and_then(|d| {
                     d.name().ok().and_then(|default_name| {
-                        cpal_device.name().ok().map(|device_name| device_name == default_name)
+                        Some(device_name == default_name)
                     })
                 }).unwrap_or(false);
                 
                 devices.push(AudioDevice {
-                    id: ffmpeg_index.to_string(),
-                    name: device_name.to_string(),
+                    id: cpal_index.to_string(), // Use CPAL index for device ID
+                    name: device_name,
                     is_default,
                 });
             }
@@ -363,18 +350,174 @@ impl Default for AudioDeviceManager {
 }
 
 /// Get the ffmpeg device index for a given device ID
-/// This maps device IDs to their corresponding ffmpeg avfoundation indices
+/// This maps CPAL device IDs to their corresponding ffmpeg avfoundation indices
 pub fn get_ffmpeg_device_index(device_id: &str) -> Option<usize> {
-    // Try to parse as a number first (new index-based approach)
-    if let Ok(index) = device_id.parse::<usize>() {
-        return Some(index);
+    // Try to parse as a number first (CPAL index)
+    if let Ok(cpal_index) = device_id.parse::<usize>() {
+        // Get the device name from CPAL using the index
+        let host = cpal::default_host();
+        if let Ok(mut devices) = host.input_devices() {
+            if let Some(device) = devices.nth(cpal_index) {
+                if let Ok(device_name) = device.name() {
+                    // Now find the ffmpeg index for this device name
+                    if let Ok(ffmpeg_devices) = get_ffmpeg_device_mapping() {
+                        for (ffmpeg_index, ffmpeg_name) in ffmpeg_devices {
+                            if ffmpeg_name == device_name {
+                                return Some(ffmpeg_index);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     
-    // Fallback to legacy device name mapping for backward compatibility
-    match device_id {
-        "Microsoft Teams Audio" => Some(0),
-        "External Microphone" => Some(1),
-        "MacBook Pro Microphone" => Some(2),
-        _ => Some(0), // Default to first device
+    // If it's not a number, try to find the device by name using ffmpeg mapping
+    if let Ok(ffmpeg_devices) = get_ffmpeg_device_mapping() {
+        for (index, name) in ffmpeg_devices {
+            if name == device_id {
+                return Some(index);
+            }
+        }
     }
+    
+    // Fallback to first device if not found
+    Some(0)
+}
+
+/// Get the optimal sample rate for a given audio device
+/// This helps avoid sample rate conversion artifacts
+pub fn get_optimal_sample_rate(device_id: &str) -> u32 {
+    // Try to get the device's native sample rate
+    let host = cpal::default_host();
+    
+    if let Ok(index) = device_id.parse::<usize>() {
+        // Use index-based lookup
+        if let Ok(mut devices) = host.input_devices() {
+            if let Some(device) = devices.nth(index) {
+                if let Ok(config) = device.default_input_config() {
+                    return config.sample_rate().0;
+                }
+            }
+        }
+    } else {
+        // Fallback to name-based lookup
+        if let Ok(mut devices) = host.input_devices() {
+            if let Some(device) = devices.find(|d| d.name().map(|name| name == device_id).unwrap_or(false)) {
+                if let Ok(config) = device.default_input_config() {
+                    return config.sample_rate().0;
+                }
+            }
+        }
+    }
+    
+    // Default to 48kHz if we can't determine the device's native rate
+    48000
+}
+
+/// Get the optimal buffer size for a given audio device
+/// This helps compensate for device latency and prevent buffer issues
+pub fn get_optimal_buffer_size(device_id: &str) -> u32 {
+    // Different devices may need different buffer sizes
+    // External devices typically need larger buffers
+    match device_id {
+        "Microsoft Teams Audio" => 2048, // Teams audio can be unstable, use larger buffer
+        "External Microphone" => 1536,   // External devices often have higher latency
+        "MacBook Pro Microphone" => 1024, // Built-in mic, smaller buffer is usually fine
+        _ => {
+            // Try to determine if it's an external device by name
+            if device_id.to_lowercase().contains("external") || 
+               device_id.to_lowercase().contains("usb") ||
+               device_id.to_lowercase().contains("bluetooth") {
+                1536 // Larger buffer for external devices
+            } else {
+                1024 // Default buffer size
+            }
+        }
+    }
+}
+
+/// Get the actual ffmpeg audio device indices by querying ffmpeg directly
+/// This ensures we have the correct mapping between device names and indices
+pub fn get_ffmpeg_device_mapping() -> Result<Vec<(usize, String)>> {
+    use std::process::Command;
+    
+    let output = Command::new("ffmpeg")
+        .args(["-f", "avfoundation", "-list_devices", "true", "-i", ""])
+        .output()
+        .map_err(|e| anyhow!("Failed to run ffmpeg: {}", e))?;
+    
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut devices = Vec::new();
+    let mut in_audio_section = false;
+    
+    for line in stderr.lines() {
+        // Check if we're entering the audio devices section
+        if line.contains("AVFoundation audio devices:") {
+            in_audio_section = true;
+            continue;
+        }
+        
+        // Check if we're entering the video devices section (stop parsing audio)
+        if line.contains("AVFoundation video devices:") {
+            in_audio_section = false;
+            continue;
+        }
+        
+        // Only parse audio devices when we're in the audio section
+        if in_audio_section && line.contains("[AVFoundation indev @") && line.contains("] [") {
+            // Parse lines like: [AVFoundation indev @ 0x12b804280] [0] Microsoft Teams Audio
+            if let Some(start) = line.find("] [") {
+                let device_part = &line[start + 3..];
+                if let Some(end) = device_part.find("] ") {
+                    if let Ok(index) = device_part[..end].parse::<usize>() {
+                        let name = device_part[end + 2..].trim().to_string();
+                        devices.push((index, name));
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(devices)
+}
+
+/// Debug function to list all available audio devices with their indices
+/// This helps verify that device enumeration is working correctly
+pub fn debug_list_audio_devices() -> Result<()> {
+    println!("=== Audio Device Debug Information ===");
+    
+    // List CPAL devices (what the application actually uses for device enumeration)
+    let host = cpal::default_host();
+    println!("\nCPAL Audio Devices (Application's Device List):");
+    if let Ok(devices) = host.input_devices() {
+        for (index, device) in devices.enumerate() {
+            if let Ok(name) = device.name() {
+                println!("  [{}] {}", index, name);
+            } else {
+                println!("  [{}] <unnamed device>", index);
+            }
+        }
+    } else {
+        println!("  Failed to enumerate CPAL devices");
+    }
+    
+    // List ffmpeg audio devices (for reference only)
+    println!("\nFFmpeg Audio Devices (for reference):");
+    match get_ffmpeg_device_mapping() {
+        Ok(ffmpeg_devices) => {
+            if ffmpeg_devices.is_empty() {
+                println!("  No audio devices found in ffmpeg output");
+            } else {
+                for (index, name) in ffmpeg_devices {
+                    println!("  [{}] {}", index, name);
+                }
+            }
+        }
+        Err(e) => {
+            println!("  Failed to get ffmpeg devices: {}", e);
+        }
+    }
+    
+    Ok(())
 }

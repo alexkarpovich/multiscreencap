@@ -18,7 +18,7 @@ use tracing::{error, info};
 use window::WindowManager;
 use recorder::{RecorderState, RecordingConfig};
 use ffmpeg::{find_ffmpeg, start_ffmpeg_for_window, send_quit_and_wait};
-use audio::AudioDeviceManager;
+use audio::{AudioDeviceManager, debug_list_audio_devices};
 
 // Cache for window preview textures with throttling
 struct PreviewCache {
@@ -143,8 +143,19 @@ impl Default for AppState {
         
         // Initialize audio device manager and select default device
         let mut audio_device_manager = AudioDeviceManager::new();
+        
+        // Debug: List all audio devices
+        if let Err(e) = debug_list_audio_devices() {
+            eprintln!("Failed to debug list audio devices: {}", e);
+        }
+        
         let selected_audio_device = match audio_device_manager.enumerate_devices() {
             Ok(devices) => {
+                info!("Found {} audio devices:", devices.len());
+                for device in &devices {
+                    info!("  [{}] {} (default: {})", device.id, device.name, device.is_default);
+                }
+                
                 // Find the default device or use the first one
                 let device_id = devices.iter()
                     .find(|d| d.is_default)

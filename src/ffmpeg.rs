@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 use crate::window::WindowInfo;
-use crate::audio::get_ffmpeg_device_index;
+use crate::audio::{get_ffmpeg_device_index, get_optimal_sample_rate};
 
 #[cfg(target_os = "macos")]
 use crate::macos;
@@ -86,6 +86,7 @@ impl FfmpegCommandBuilder {
                     .and_then(|device_name| get_ffmpeg_device_index(device_name))
                     .unwrap_or(2); // Default to MacBook Pro Microphone
                 
+                info!("Using audio device index: {} for device: {:?}", device_index, self.audio_input_device);
                 
                 cmd.arg("-f")
                     .arg("avfoundation")
@@ -181,20 +182,31 @@ impl FfmpegCommandBuilder {
 
         // Add audio codec if device is provided
         if self.audio_input_device.is_some() {
+            // Get optimal sample rate for the device to avoid conversion artifacts
+            let sample_rate = self.audio_input_device.as_ref()
+                .map(|device_id| get_optimal_sample_rate(device_id))
+                .unwrap_or(48000);
+            
             cmd.arg("-c:a")
                 .arg("aac")
                 .arg("-b:a")
                 .arg("192k") // Higher bitrate for better quality
                 .arg("-ar")
-                .arg("48000") // Higher sample rate
+                .arg(format!("{}", sample_rate)) // Use device's optimal sample rate
                 .arg("-ac")
                 .arg("2") // Stereo
                 .arg("-af")
-                .arg("highpass=f=80,lowpass=f=15000,volume=0.8") // Noise reduction and volume normalization
+                .arg("aresample=async=1:min_hard_comp=0.100000:first_pts=0,highpass=f=60:width_type=h:width=0.5,lowpass=f=18000:width_type=h:width=0.5,volume=0.9,adelay=0|0") // Improved filters with delay compensation
                 .arg("-map")
                 .arg("0:v") // Map video from first input (stdin)
                 .arg("-map")
                 .arg("1:a") // Map audio from second input (audio device)
+                .arg("-async")
+                .arg("1") // Audio sync method
+                .arg("-vsync")
+                .arg("cfr") // Constant frame rate for better sync
+                .arg("-copyts") // Copy timestamps to preserve sync
+                .arg("-start_at_zero") // Start timestamps at zero
                 .arg("-shortest"); // End when the shortest input ends
         } else {
             // If no audio, just map the video stream
